@@ -3,8 +3,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 
+from app.core.database import get_db
+from app.models.project import Project
+from app.models.requirement import Requirement, RequirementVersion
 from app.schemas.requirement import (
     AnalysisResult,
     ProjectCreate,
@@ -19,11 +23,29 @@ from app.worker.tasks import analyze_requirement_task
 
 router = APIRouter()
 
-# ── In-memory stores (replaced by DB in the next iteration) ──
-_projects: dict[uuid.UUID, ProjectResponse] = {}
-_requirements: dict[uuid.UUID, RequirementResponse] = {}
-_versions: dict[uuid.UUID, RequirementVersionResponse] = {}
-_analysis: dict[uuid.UUID, AnalysisResult] = {}
+
+# ── Helpers ──────────────────────────────────────────────────
+
+def _build_requirement_response(
+    req: Requirement,
+    version: RequirementVersion | None = None,
+) -> RequirementResponse:
+    """Build a RequirementResponse from ORM objects."""
+    if version is None and req.versions:
+        version = req.versions[-1]
+
+    current_version = None
+    if version is not None:
+        current_version = RequirementVersionResponse.model_validate(version)
+
+    return RequirementResponse(
+        id=req.id,
+        project_id=req.project_id,
+        status=RequirementStatus(req.status),
+        current_version=current_version,
+        created_at=req.created_at,
+        updated_at=req.updated_at,
+    )
 
 
 # ── Projects ─────────────────────────────────────────────────
@@ -33,17 +55,15 @@ _analysis: dict[uuid.UUID, AnalysisResult] = {}
     response_model=ProjectResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_project(payload: ProjectCreate) -> ProjectResponse:
-    now = datetime.now(tz=timezone.utc)
-    project = ProjectResponse(
-        id=uuid.uuid4(),
-        name=payload.name,
-        description=payload.description,
-        created_at=now,
-        updated_at=now,
-    )
-    _projects[project.id] = project
-    return project
+def create_project(
+    payload: ProjectCreate,
+    db: Session = Depends(get_db),
+) -> ProjectResponse:
+    project = Project(name=payload.name, description=payload.description)
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return ProjectResponse.model_validate(project)
 
 
 # ── Requirements ─────────────────────────────────────────────
@@ -56,41 +76,33 @@ def create_project(payload: ProjectCreate) -> ProjectResponse:
 def create_requirement(
     project_id: uuid.UUID,
     payload: RequirementCreate,
+    db: Session = Depends(get_db),
 ) -> RequirementResponse:
-    if project_id not in _projects:
+    project = db.get(Project, project_id)
+    if project is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Project {project_id} not found",
         )
 
-    now = datetime.now(tz=timezone.utc)
-    req_id = uuid.uuid4()
-    version_id = uuid.uuid4()
+    requirement = Requirement(project_id=project_id)
+    db.add(requirement)
+    db.flush()  # populate requirement.id before inserting version
 
-    version = RequirementVersionResponse(
-        id=version_id,
-        requirement_id=req_id,
-        version_number=1,
+    version = RequirementVersion(
+        requirement_id=requirement.id,
         text_content=payload.text_content,
-        quality_score=None,
-        created_at=now,
+        # version_number is set by the DB trigger
     )
-    _versions[version_id] = version
-
-    requirement = RequirementResponse(
-        id=req_id,
-        project_id=project_id,
-        status=RequirementStatus.DRAFT,
-        current_version=version,
-        created_at=now,
-        updated_at=now,
-    )
-    _requirements[req_id] = requirement
+    db.add(version)
+    db.commit()
+    db.refresh(requirement)
+    db.refresh(version)
 
     # Fire async analysis
-    analyze_requirement_task.delay(str(version_id))
+    analyze_requirement_task.delay(str(version.id))
 
-    return requirement
+    return _build_requirement_response(requirement, version)
 
 
 @router.put(
@@ -100,42 +112,32 @@ def create_requirement(
 def update_requirement(
     req_id: uuid.UUID,
     payload: RequirementUpdate,
+    db: Session = Depends(get_db),
 ) -> RequirementResponse:
-    requirement = _requirements.get(req_id)
+    requirement = db.get(Requirement, req_id)
     if requirement is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Requirement {req_id} not found",
         )
 
-    now = datetime.now(tz=timezone.utc)
-    prev_version = requirement.current_version
-    next_number = (prev_version.version_number + 1) if prev_version else 1
-    version_id = uuid.uuid4()
+    # Mark requirement as draft (triggers updated_at via DB trigger)
+    requirement.status = "draft"
 
-    new_version = RequirementVersionResponse(
-        id=version_id,
+    new_version = RequirementVersion(
         requirement_id=req_id,
-        version_number=next_number,
         text_content=payload.text_content,
-        quality_score=None,
-        created_at=now,
+        # version_number is set by the DB trigger
     )
-    _versions[version_id] = new_version
-
-    updated = requirement.model_copy(
-        update={
-            "current_version": new_version,
-            "status": RequirementStatus.DRAFT,
-            "updated_at": now,
-        }
-    )
-    _requirements[req_id] = updated
+    db.add(new_version)
+    db.commit()
+    db.refresh(requirement)
+    db.refresh(new_version)
 
     # Fire async analysis for the new version
-    analyze_requirement_task.delay(str(version_id))
+    analyze_requirement_task.delay(str(new_version.id))
 
-    return updated
+    return _build_requirement_response(requirement, new_version)
 
 
 # ── Analysis ─────────────────────────────────────────────────
@@ -144,31 +146,30 @@ def update_requirement(
     "/requirements/{req_id}/analysis",
     response_model=AnalysisResult,
 )
-def get_analysis(req_id: uuid.UUID) -> AnalysisResult:
-    requirement = _requirements.get(req_id)
+def get_analysis(
+    req_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> AnalysisResult:
+    requirement = db.get(Requirement, req_id)
     if requirement is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Requirement {req_id} not found",
         )
 
-    if req_id in _analysis:
-        return _analysis[req_id]
-
-    # Return a mock result when no real analysis has completed yet
-    current = requirement.current_version
-    if current is None:
+    if not requirement.versions:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No versions exist for this requirement",
         )
 
-    mock = AnalysisResult(
+    latest = requirement.versions[-1]
+
+    return AnalysisResult(
         requirement_id=req_id,
-        version_id=current.id,
-        version_number=current.version_number,
-        quality_score=current.quality_score or 0.0,
-        status=requirement.status,
-        analyzed_at=datetime.now(tz=timezone.utc),
+        version_id=latest.id,
+        version_number=latest.version_number,
+        quality_score=float(latest.quality_score) if latest.quality_score is not None else 0.0,
+        status=RequirementStatus(requirement.status),
+        analyzed_at=latest.created_at,
     )
-    return mock
