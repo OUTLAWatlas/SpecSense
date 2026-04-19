@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
 
+    # LLM (Ollama)
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
